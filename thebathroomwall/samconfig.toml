@@ -1,0 +1,9 @@
+version = 0.1
+[default.deploy.parameters]
+stack_name = "BathroomWallProd"
+resolve_s3 = true
+s3_prefix = "BathroomWallProd"
+region = "us-east-1"
+capabilities = "CAPABILITY_IAM"
+parameter_overrides = "SiteBucketName=\"thebathroomwall.link\""
+image_repositories = []

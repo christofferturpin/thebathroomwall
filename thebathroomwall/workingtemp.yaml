@@ -1,0 +1,209 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Bathroom Wall Serverless Anonymous Message Wall
+
+Globals:
+  Function:
+    Timeout: 10
+    Runtime: python3.13
+    MemorySize: 128
+
+Parameters:
+  SiteBucketName:
+    Type: String
+    Description: Must match domain (used for CloudFront origin)
+
+Resources:
+
+  ### S3 Bucket ###
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref SiteBucketName
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  ### 2. S3 Bucket Policies ###
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    DependsOn: WebsiteDistribution
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: "s3:GetObject"
+            Resource: !Sub "${FrontendBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${WebsiteDistribution}"
+
+  ### 3. OAC for CloudFront ###
+  WebsiteOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: BathroomWall-OAC
+        Description: CloudFront OAC for accessing private S3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+        OriginAccessControlOriginType: s3
+
+  ### 4. CloudFront Distro ###
+  WebsiteDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            S3OriginConfig: {}  
+            OriginAccessControlId: !GetAtt WebsiteOAC.Id  
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+  ### 5. DynamoDB ###
+  MessagesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: Messages
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  RateLimitTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: RateLimit
+      AttributeDefinitions:
+        - AttributeName: ip
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ip
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  MessageIndexTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: MessageIndex
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  ### 6. Mary Had a Little Lambda ###
+  SubmitMessageFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: SubmitMessage
+      CodeUri: backend/submit_message/
+      Handler: postMessage.lambda_handler
+      Policies:
+        - AmazonDynamoDBFullAccess
+      Events:
+        SubmitAPI:
+          Type: HttpApi
+          Properties:
+            Path: /submit
+            Method: POST
+            ApiId: !Ref AppHttpApi
+
+  GetRandomMessageFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: GetRandomMessage
+      CodeUri: backend/get_random_message/
+      Handler: getMessage.lambda_handler
+      Policies:
+        - AmazonDynamoDBFullAccess
+      Events:
+        GetAPI:
+          Type: HttpApi
+          Properties:
+            Path: /random
+            Method: GET
+            ApiId: !Ref AppHttpApi
+
+  CleanupFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: CleanupFunction
+      CodeUri: backend/cleanup_removed/
+      Handler: cleanup.lambda_handler
+      Policies:
+        - AmazonDynamoDBFullAccess
+      Events:
+        DailySchedule:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 4 * * ? *)
+
+  ### 7. API Gate way, CORS (I hate you CORS) ###
+  AppHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowOrigins:
+          - !Sub "https://${SiteBucketName}"
+          - !Sub "https://www.${SiteBucketName}"
+          - !Sub "https://${WebsiteDistribution.DomainName}"
+        AllowHeaders:
+          - "*"
+        AllowMethods:
+          - GET
+          - POST
+          - OPTIONS
+        MaxAge: 600
+
+Outputs:
+  WebsiteURL:
+    Description: "S3 Static Website URL"
+    Value: !GetAtt FrontendBucket.WebsiteURL
+
+  ApiEndpoint:
+    Description: "HTTP API Endpoint"
+    Value: !Sub "https://${AppHttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+
+  CloudFrontURL:
+    Description: "CloudFront distribution URL"
+    Value: !Sub "https://${WebsiteDistribution.DomainName}"

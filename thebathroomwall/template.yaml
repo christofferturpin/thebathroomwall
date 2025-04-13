@@ -1,0 +1,233 @@
+# AWS SAM Template for Bathroom Wall Project
+# This file defines all serverless infrastructure using AWS SAM
+# including DynamoDB tables, Lambda functions, S3 frontend, CloudFront distribution, and API Gateway.
+
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Bathroom Wall - Serverless Anonymous Message Board
+
+# Default settings applied to all Lambda functions and HTTP API Gateway
+Globals:
+  Function:
+    Timeout: 10
+    Runtime: python3.12
+    MemorySize: 128
+  HttpApi:
+    Cors:  # CORS setup so frontend can make requests to backend
+      AllowMethods: GET,POST,OPTIONS
+      AllowHeaders: content-type
+      AllowOrigins: "*"
+      MaxAge: 600
+
+# Parameters allow this template to be reused across environments
+Parameters:
+  SiteBucketName:
+    Type: String
+    Description: Name of the S3 bucket for hosting frontend
+    Default: thebathroomwall.com
+
+  DomainName:
+    Type: String
+    Default: thebathroomwall.com
+    Description: Custom domain name for CloudFront distribution
+
+  AcmCertificateArn:
+    Type: String
+    Description: ACM certificate ARN (must be in us-east-1 for CloudFront)
+
+# --- Resources ---
+Resources:
+
+  # Stores submitted messages
+  MessagesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: Messages
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true  # adds ability to restore deleted data
+
+  # Lightweight index for message IDs to speed up random lookups
+  MessageIndexTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: MessageIndex
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # Table for IP-based rate limiting with TTL
+  RateLimitTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: RateLimit
+      AttributeDefinitions:
+        - AttributeName: ip
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ip
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # Lambda function to handle /submit POST endpoint
+  SubmitMessageFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: SubmitMessage
+      CodeUri: backend/submit_message/
+      Handler: postMessage.lambda_handler
+      Policies:  # Least-privilege access to message + rate limit tables
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:GetItem
+              Resource: 
+                - !GetAtt MessagesTable.Arn
+                - !GetAtt RateLimitTable.Arn
+      Events:
+        SubmitAPI:
+          Type: HttpApi
+          Properties:
+            Path: /submit
+            Method: POST
+
+  # Lambda function to handle /random GET endpoint
+  GetRandomMessageFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: GetRandomMessage
+      CodeUri: backend/get_random_message/
+      Handler: getMessage.lambda_handler
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:Scan
+              Resource: 
+                - !GetAtt MessagesTable.Arn
+                - !GetAtt MessageIndexTable.Arn
+      Events:
+        GetAPI:
+          Type: HttpApi
+          Properties:
+            Path: /random
+            Method: GET
+
+  # Lambda function that deletes [removed] messages nightly
+  CleanupRemovedMessagesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: CleanupRemovedMessages
+      CodeUri: backend/cleanup_removed/
+      Handler: cleanup.lambda_handler
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:DeleteItem
+                - dynamodb:Scan
+              Resource: 
+                - !GetAtt MessagesTable.Arn
+                - !GetAtt MessageIndexTable.Arn
+      Events:
+        DailyCleanupTrigger:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 4 * * ? *)  # every day at 4 AM UTC
+
+  # Creates a CloudFront OAI to securely read from the S3 bucket
+  CloudFrontOriginAccessIdentity:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Sub "OAI for ${AWS::StackName}"
+
+  # Public S3 bucket for the static frontend website
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref SiteBucketName
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+      VersioningConfiguration:
+        Status: Enabled
+    DeletionPolicy: Retain  # keep the bucket even if stack is deleted
+
+  # Bucket policy granting CloudFront OAI read access
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "AllowCloudFrontOAI"
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity ${CloudFrontOriginAccessIdentity}"
+            Action: s3:GetObject
+            Resource: !Sub "${FrontendBucket.Arn}/*"
+
+  # CloudFront distribution for HTTPS + CDN delivery of static site
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Aliases:
+          - !Ref DomainName
+        Origins:
+          - DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            Id: S3Origin
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub "origin-access-identity/cloudfront/${CloudFrontOriginAccessIdentity}"
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+          Compress: true
+        PriceClass: PriceClass_100
+        ViewerCertificate:
+          AcmCertificateArn: !Ref AcmCertificateArn
+          SslSupportMethod: sni-only
+        HttpVersion: http2
+
+# --- Outputs to show in CloudFormation console after deploy ---
+Outputs:
+  CloudFrontDomainName:
+    Description: "CloudFront Distribution Domain Name"
+    Value: !GetAtt CloudFrontDistribution.DomainName
+
+  ApiEndpoint:
+    Description: "API Gateway endpoint URL"
+    Value: !Sub "https://${MyApi}.execute-api.${AWS::Region}.amazonaws.com"

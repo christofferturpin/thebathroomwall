@@ -1,0 +1,195 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Bathroom Wall – Clean Serverless Stack
+
+Globals:
+  Function:
+    Timeout: 10
+    Runtime: python3.13
+    MemorySize: 128
+
+Parameters:
+  SiteBucketName:
+    Type: String
+    Description: Name of the S3 bucket for hosting frontend (must be globally unique), match the name of the domain.
+
+Resources:
+
+  ### 1. S3 Static Site Bucket ###
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref SiteBucketName
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: false
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: false
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: PublicReadGetObject
+            Effect: Allow
+            Principal: "*"
+            Action: "s3:GetObject"
+            Resource: !Sub "${FrontendBucket.Arn}/*"
+
+  ### 2. DynamoDB Tables ###
+  MessagesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: Messages
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  RateLimitTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: RateLimit
+      AttributeDefinitions:
+        - AttributeName: ip
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ip
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  MessageIndexTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: MessageIndex
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  ### 3. Mary had a little lambda ###
+  SubmitMessageFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: SubmitMessage
+      CodeUri: backend/submit_message/
+      Handler: postMessage.lambda_handler
+      Runtime: python3.13
+      Policies:
+        - AmazonDynamoDBFullAccess
+      Events:
+        SubmitAPI:
+          Type: HttpApi
+          Properties:
+            Path: /submit
+            Method: POST
+            ApiId: !Ref AppHttpApi
+
+  GetRandomMessageFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: GetRandomMessage
+      CodeUri: backend/get_random_message/
+      Handler: getMessage.lambda_handler
+      Runtime: python3.13
+      Policies:
+        - AmazonDynamoDBFullAccess
+      Events:
+        GetAPI:
+          Type: HttpApi
+          Properties:
+            Path: /random
+            Method: GET
+            ApiId: !Ref AppHttpApi
+
+  CleanupFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: CleanupFunction
+      CodeUri: backend/cleanup_removed/
+      Handler: cleanup.lambda_handler
+      Runtime: python3.13
+      Policies:
+        - AmazonDynamoDBFullAccess
+      Events:
+        DailySchedule:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 4 * * ? *)  # 4:00 AM UTC
+
+  ### 4. HTTP API Gateway ###
+  AppHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowOrigins:
+          - !Sub "http://${SiteBucketName}.s3-website-${AWS::Region}.amazonaws.com"
+        AllowHeaders:
+          - "*"
+        AllowMethods:
+          - GET
+          - POST
+          - OPTIONS
+        MaxAge: 600
+
+  ### 5. CloudFront Distribution ###
+  WebsiteDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Origins:
+          - DomainName: !GetAtt FrontendBucket.DomainName
+            Id: S3Origin
+            CustomOriginConfig:
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginProtocolPolicy: http-only
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+Outputs:
+  WebsiteURL:
+    Description: "S3 Static Website URL"
+    Value: !GetAtt FrontendBucket.WebsiteURL
+
+  ApiEndpoint:
+    Description: "HTTP API Endpoint"
+    Value: !Sub "https://${AppHttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+
+  CloudFrontURL:
+    Description: "CloudFront distribution URL"
+    Value: !Sub "https://${WebsiteDistribution.DomainName}"
