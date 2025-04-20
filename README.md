@@ -1,7 +1,7 @@
 # thebathroomwall
 Serverless Anonymous Message Wall. 
 
-This is my attempt at capturing the magic of latrinalia (bathroom graffiti) using AWS Lambda, API Gateway, S3, DynamoDB, CloudFront, and SAM. The frontend lives in a private S3 bucket and is served securely via CloudFront/OAC. The backend is powered by three Lambda functions (post message, get message, and a cleanup function) and three DynamoDB tables (one storing the messages, an index table for scalability, and a table that integrates with the post message Lambda to handle rate limiting). This project demonstrates best practices in modern cloud architectures and showcases my ability to design, deploy, optimize, and troubleshoot production-grade serverless solutions.
+This is my attempt at capturing the magic of latrinalia (bathroom graffiti) using AWS Lambda, API Gateway, S3, DynamoDB, CloudFront, and SAM. The frontend lives in a private S3 bucket and is served securely via CloudFront/OAC. The backend is powered by three Lambda functions (post message, get message, and a cleanup function) and three DynamoDB tables (one storing the messages, an index table for scalability, and a table that integrates with the post message Lambda to handle rate limiting). This project demonstrates best practices in modern cloud architectures and showcases my ability to design, deploy, optimize, and troubleshoot (basically) production-grade serverless solutions.
 
 To Use:
   1) Deploy the infrastructure with SAM.
